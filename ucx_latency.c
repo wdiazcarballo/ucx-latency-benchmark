@@ -13,6 +13,8 @@ typedef struct {
     ucp_ep_h ep;
     ucp_worker_h worker;
     ucp_context_h context;
+    ucp_rkey_h rkey;
+    void *remote_mem;
 } ucx_context_t;
 
 static void request_init(void *request) {
@@ -42,9 +44,7 @@ static double get_time() {
 
 static void ping_pong(ucx_context_t *ctx, size_t msg_size) {
     void *local_buf = malloc(msg_size);
-    void *remote_buf = malloc(msg_size);
     memset(local_buf, 0, msg_size);
-    memset(remote_buf, 0, msg_size);
 
     ucp_request_param_t params;
     request_init(&params);
@@ -55,9 +55,7 @@ static void ping_pong(ucx_context_t *ctx, size_t msg_size) {
         ucs_status_t status;
 
         // Put operation
-        params.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK;
-        params.cb.send = (ucp_send_nbx_callback_t)flush_callback;
-        void *request = ucp_put_nbx(ctx->ep, local_buf, msg_size, (uintptr_t)remote_buf, &params);
+        void *request = ucp_put_nbx(ctx->ep, local_buf, msg_size, (uintptr_t)ctx->remote_mem, ctx->rkey, &params);
         if (UCS_PTR_IS_ERR(request)) {
             fprintf(stderr, "ucp_put_nbx failed\n");
             exit(1);
@@ -82,7 +80,6 @@ static void ping_pong(ucx_context_t *ctx, size_t msg_size) {
     printf("Message size: %zu bytes, latency: %.2f ms\n", msg_size, latency);
 
     free(local_buf);
-    free(remote_buf);
 }
 
 int main(int argc, char **argv) {
@@ -128,7 +125,11 @@ int main(int argc, char **argv) {
     // Exchange addresses between Rank 0 and Rank 1
     // ...
 
-    status = ucp_ep_create(ctx.worker, &params, &ctx.ep);
+    ucp_ep_params_t ep_params;
+    ep_params.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS;
+    ep_params.address = ctx.address;
+
+    status = ucp_ep_create(ctx.worker, &ep_params, &ctx.ep);
     if (status != UCS_OK) {
         fprintf(stderr, "ucp_ep_create failed\n");
         ucp_worker_release_address(ctx.worker, ctx.address);
@@ -137,10 +138,57 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    // Allocate remote memory and register the key
+    ctx.remote_mem = malloc(MAX_MSG_SIZE);
+    ucp_mem_map_params_t mem_map_params;
+    mem_map_params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS |
+                                UCP_MEM_MAP_PARAM_FIELD_LENGTH;
+    mem_map_params.address = ctx.remote_mem;
+    mem_map_params.length = MAX_MSG_SIZE;
+
+    ucp_mem_h memh;
+    status = ucp_mem_map(ctx.context, &mem_map_params, &memh);
+    if (status != UCS_OK) {
+        fprintf(stderr, "ucp_mem_map failed\n");
+        ucp_ep_destroy(ctx.ep);
+        ucp_worker_release_address(ctx.worker, ctx.address);
+        ucp_worker_destroy(ctx.worker);
+        ucp_cleanup(ctx.context);
+        return -1;
+    }
+
+    ucp_rkey_bundle_t rkey_bundle;
+    status = ucp_rkey_pack(ctx.context, memh, &rkey_bundle);
+    if (status != UCS_OK) {
+        fprintf(stderr, "ucp_rkey_pack failed\n");
+        ucp_mem_unmap(ctx.context, memh);
+        ucp_ep_destroy(ctx.ep);
+        ucp_worker_release_address(ctx.worker, ctx.address);
+        ucp_worker_destroy(ctx.worker);
+        ucp_cleanup(ctx.context);
+        return -1;
+    }
+
+    status = ucp_ep_rkey_unpack(ctx.ep, rkey_bundle.rkey_buffer, &ctx.rkey);
+    if (status != UCS_OK) {
+        fprintf(stderr, "ucp_ep_rkey_unpack failed\n");
+        ucp_rkey_buffer_release(rkey_bundle.rkey_buffer);
+        ucp_mem_unmap(ctx.context, memh);
+        ucp_ep_destroy(ctx.ep);
+        ucp_worker_release_address(ctx.worker, ctx.address);
+        ucp_worker_destroy(ctx.worker);
+        ucp_cleanup(ctx.context);
+        return -1;
+    }
+
+    ucp_rkey_buffer_release(rkey_bundle.rkey_buffer);
+
     for (size_t msg_size = 8; msg_size <= MAX_MSG_SIZE; msg_size *= 2) {
         ping_pong(&ctx, msg_size);
     }
 
+    ucp_rkey_destroy(ctx.rkey);
+    ucp_mem_unmap(ctx.context, memh);
     ucp_ep_destroy(ctx.ep);
     ucp_worker_release_address(ctx.worker, ctx.address);
     ucp_worker_destroy(ctx.worker);

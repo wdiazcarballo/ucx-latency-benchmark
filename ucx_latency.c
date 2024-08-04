@@ -157,8 +157,9 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    ucp_rkey_bundle_t rkey_bundle;
-    status = ucp_rkey_pack(ctx.context, memh, &rkey_bundle);
+    void *rkey_buffer;
+    size_t rkey_buffer_size;
+    status = ucp_rkey_pack(ctx.context, memh, &rkey_buffer, &rkey_buffer_size);
     if (status != UCS_OK) {
         fprintf(stderr, "ucp_rkey_pack failed\n");
         ucp_mem_unmap(ctx.context, memh);
@@ -169,10 +170,10 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    status = ucp_ep_rkey_unpack(ctx.ep, rkey_bundle.rkey_buffer, &ctx.rkey);
+    status = ucp_ep_rkey_unpack(ctx.ep, rkey_buffer, &ctx.rkey);
     if (status != UCS_OK) {
         fprintf(stderr, "ucp_ep_rkey_unpack failed\n");
-        ucp_rkey_buffer_release(rkey_bundle.rkey_buffer);
+        ucp_rkey_buffer_release(rkey_buffer);
         ucp_mem_unmap(ctx.context, memh);
         ucp_ep_destroy(ctx.ep);
         ucp_worker_release_address(ctx.worker, ctx.address);
@@ -181,7 +182,7 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    ucp_rkey_buffer_release(rkey_bundle.rkey_buffer);
+    ucp_rkey_buffer_release(rkey_buffer);
 
     for (size_t msg_size = 8; msg_size <= MAX_MSG_SIZE; msg_size *= 2) {
         ping_pong(&ctx, msg_size);
